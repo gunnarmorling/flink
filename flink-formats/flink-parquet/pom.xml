@@ -96,7 +96,15 @@ under the License.
 			<scope>provided</scope>
 		</dependency>
 
-		<!-- Parquet -->
+		<!-- Hardwood (Parquet reader replacement) -->
+
+		<dependency>
+			<groupId>dev.hardwood</groupId>
+			<artifactId>hardwood-core</artifactId>
+			<version>${hardwood.version}</version>
+		</dependency>
+
+		<!-- Parquet (retained for write path, statistics, Avro/Protobuf) -->
 
 		<dependency>
 			<groupId>org.apache.parquet</groupId>
