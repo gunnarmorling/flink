@@ -54,7 +54,6 @@ import org.apache.flink.table.utils.DateTimeUtils;
 import org.apache.flink.util.InstantiationUtil;
 
 import org.apache.hadoop.conf.Configuration;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -141,7 +140,6 @@ class ParquetColumnarRowInputFormatTest {
         return Arrays.asList(10, 1000);
     }
 
-    @Disabled("Hardwood reader does not yet support nested types (ARRAY, MAP, ROW)")
     @ParameterizedTest
     @MethodSource("parameters")
     void testTypesReadWithSplits(int rowGroupSize) throws IOException {
@@ -156,7 +154,6 @@ class ParquetColumnarRowInputFormatTest {
         innerTestTypes(folder, values, rowGroupSize);
     }
 
-    @Disabled("Hardwood reader does not yet support nested types (ARRAY, MAP, ROW)")
     @ParameterizedTest
     @MethodSource("parameters")
     void testDictionary(int rowGroupSize) throws IOException {
@@ -176,7 +173,6 @@ class ParquetColumnarRowInputFormatTest {
         innerTestTypes(folder, values, rowGroupSize);
     }
 
-    @Disabled("Hardwood reader does not yet support nested types (ARRAY, MAP, ROW)")
     @ParameterizedTest
     @MethodSource("parameters")
     void testPartialDictionary(int rowGroupSize) throws IOException {
@@ -197,7 +193,6 @@ class ParquetColumnarRowInputFormatTest {
         innerTestTypes(folder, values, rowGroupSize);
     }
 
-    @Disabled("Hardwood reader does not yet support nested types (ARRAY, MAP, ROW)")
     @ParameterizedTest
     @MethodSource("parameters")
     void testContinuousRepetition(int rowGroupSize) throws IOException {
@@ -214,7 +209,6 @@ class ParquetColumnarRowInputFormatTest {
         innerTestTypes(folder, values, rowGroupSize);
     }
 
-    @Disabled("Hardwood reader does not yet support nested types (ARRAY, MAP, ROW)")
     @ParameterizedTest
     @MethodSource("parameters")
     void testLargeValue(int rowGroupSize) throws IOException {

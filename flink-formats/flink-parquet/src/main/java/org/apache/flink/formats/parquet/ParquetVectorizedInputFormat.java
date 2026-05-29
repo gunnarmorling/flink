@@ -25,19 +25,17 @@ import org.apache.flink.connector.file.src.reader.BulkFormat;
 import org.apache.flink.connector.file.src.util.CheckpointedPosition;
 import org.apache.flink.connector.file.src.util.Pool;
 import org.apache.flink.core.fs.Path;
-import org.apache.flink.formats.parquet.hardwood.HardwoodColumnVectorFiller;
+import org.apache.flink.formats.parquet.hardwood.HardwoodFieldReader;
 import org.apache.flink.formats.parquet.utils.SerializableConfiguration;
 import org.apache.flink.formats.parquet.vector.ColumnBatchFactory;
-import org.apache.flink.formats.parquet.vector.ParquetDecimalVector;
 import org.apache.flink.table.data.columnar.vector.ColumnVector;
 import org.apache.flink.table.data.columnar.vector.VectorizedColumnBatch;
 import org.apache.flink.table.data.columnar.vector.writable.WritableColumnVector;
 import org.apache.flink.table.types.logical.LogicalType;
-import org.apache.flink.table.types.logical.LogicalTypeRoot;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.util.Preconditions;
 
-import dev.hardwood.reader.ColumnReader;
+import dev.hardwood.reader.ColumnReaders;
 import dev.hardwood.schema.FileSchema;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -45,7 +43,9 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
@@ -98,25 +98,56 @@ public abstract class ParquetVectorizedInputFormat<T, SplitT extends FileSourceS
         java.nio.file.Path nioPath = java.nio.file.Path.of(uri);
 
         dev.hardwood.reader.ParquetFileReader hardwoodReader =
-                dev.hardwood.reader.ParquetFileReader.open(nioPath);
+                dev.hardwood.reader.ParquetFileReader.open(dev.hardwood.InputFile.of(nioPath));
 
         FileSchema fileSchema = hardwoodReader.getFileSchema();
 
         // Resolve projected column names in the file schema (case-sensitive or insensitive)
-        String[] resolvedColumnNames = resolveColumnNames(fileSchema);
+        String[] resolvedFieldNames = resolveFieldNames(fileSchema);
 
-        // Count total rows across all row groups
-        long totalRowCount = 0;
-        for (dev.hardwood.metadata.RowGroup rg : hardwoodReader.getFileMetaData().rowGroups()) {
-            totalRowCount += rg.numRows();
+        // Read all projected fields through a single coordinated ColumnReaders, scoped to the row
+        // groups whose midpoint falls inside this split's byte range so that disjoint splits read
+        // disjoint row groups (standard split convention).
+        long splitStart = split.offset();
+        long splitLength = split.length();
+        // Match parquet-mr's range semantics: pass `start + length` as the exclusive end and
+        // tolerate long overflow (in which case the range becomes empty). This is what existing
+        // Flink callers — including the test that constructs splits with length=Long.MAX_VALUE —
+        // rely on for the tail split to return zero rows when an earlier split already covers
+        // the rest of the file.
+        long splitEnd = splitStart + splitLength;
+
+        // Project the resolved top-level fields (parent groups expand to all their leaves). Fields
+        // not present in the file resolve to null and are filled with nulls without a reader.
+        List<String> projectedColumns = new ArrayList<>(resolvedFieldNames.length);
+        for (String name : resolvedFieldNames) {
+            if (name != null) {
+                projectedColumns.add(name);
+            }
+        }
+        dev.hardwood.reader.ColumnReaders columnReaders =
+                projectedColumns.isEmpty()
+                        ? null
+                        : hardwoodReader
+                                .buildColumnReaders(
+                                        dev.hardwood.schema.ColumnProjection.columns(
+                                                projectedColumns.toArray(new String[0])))
+                                .filter(
+                                        dev.hardwood.reader.RowGroupPredicate.byteRange(
+                                                splitStart, splitEnd))
+                                .build();
+
+        HardwoodFieldReader[] fieldReaders = new HardwoodFieldReader[projectedTypes.length];
+        for (int i = 0; i < projectedTypes.length; i++) {
+            fieldReaders[i] =
+                    HardwoodFieldReader.create(
+                            fileSchema, columnReaders, projectedTypes[i], resolvedFieldNames[i]);
         }
 
         final Pool<ParquetReaderBatch<T>> poolOfBatches =
-                createPoolOfBatches(
-                        split, numBatchesToCirculate(config), fileSchema, resolvedColumnNames);
+                createPoolOfBatches(split, numBatchesToCirculate(config), fieldReaders);
 
-        return new HardwoodReader(
-                hardwoodReader, resolvedColumnNames, totalRowCount, poolOfBatches);
+        return new HardwoodReader(hardwoodReader, columnReaders, fieldReaders, poolOfBatches);
     }
 
     protected int numBatchesToCirculate(Configuration config) {
@@ -140,16 +171,15 @@ public abstract class ParquetVectorizedInputFormat<T, SplitT extends FileSourceS
 
     @Override
     public boolean isSplittable() {
-        // Hardwood memory-maps entire files; split-level byte-range filtering is not supported.
-        return false;
+        return true;
     }
 
     /**
-     * Resolve projected field names against the Hardwood file schema, handling case-sensitive and
-     * case-insensitive matching. Returns null for fields not found in the file (they will be filled
-     * with nulls).
+     * Resolve projected top-level field names against the Hardwood file schema, handling
+     * case-sensitive and case-insensitive matching. Returns null for fields not found in the file
+     * (they will be filled with nulls).
      */
-    private String[] resolveColumnNames(FileSchema fileSchema) {
+    private String[] resolveFieldNames(FileSchema fileSchema) {
         String[] resolved = new String[projectedFields.length];
 
         if (isCaseSensitive) {
@@ -165,7 +195,6 @@ public abstract class ParquetVectorizedInputFormat<T, SplitT extends FileSourceS
                 }
             }
         } else {
-            // Build case-insensitive name map from top-level fields
             Map<String, String> caseInsensitiveMap = new HashMap<>();
             for (dev.hardwood.schema.SchemaNode child : fileSchema.getRootNode().children()) {
                 caseInsensitiveMap.put(child.name().toLowerCase(Locale.ROOT), child.name());
@@ -184,138 +213,39 @@ public abstract class ParquetVectorizedInputFormat<T, SplitT extends FileSourceS
     }
 
     private Pool<ParquetReaderBatch<T>> createPoolOfBatches(
-            SplitT split, int numBatches, FileSchema fileSchema, String[] resolvedColumnNames) {
+            SplitT split, int numBatches, HardwoodFieldReader[] fieldReaders) {
         final Pool<ParquetReaderBatch<T>> pool = new Pool<>(numBatches);
-
         for (int i = 0; i < numBatches; i++) {
-            pool.add(createReaderBatch(split, pool.recycler(), fileSchema, resolvedColumnNames));
+            pool.add(createReaderBatch(split, pool.recycler(), fieldReaders));
         }
-
         return pool;
     }
 
     private ParquetReaderBatch<T> createReaderBatch(
             SplitT split,
             Pool.Recycler<ParquetReaderBatch<T>> recycler,
-            FileSchema fileSchema,
-            String[] resolvedColumnNames) {
-        WritableColumnVector[] writableVectors =
-                createWritableVectors(fileSchema, resolvedColumnNames);
-        VectorizedColumnBatch columnarBatch =
-                batchFactory.create(split, createReadableVectors(writableVectors));
+            HardwoodFieldReader[] fieldReaders) {
+        WritableColumnVector[] writableVectors = new WritableColumnVector[fieldReaders.length];
+        ColumnVector[] readableVectors = new ColumnVector[fieldReaders.length];
+        for (int i = 0; i < fieldReaders.length; i++) {
+            writableVectors[i] = fieldReaders[i].createWritableVector(batchSize);
+            readableVectors[i] = wrapReadable(writableVectors[i], projectedTypes[i]);
+        }
+        VectorizedColumnBatch columnarBatch = batchFactory.create(split, readableVectors);
         return createReaderBatch(writableVectors, columnarBatch, recycler);
     }
 
-    private WritableColumnVector[] createWritableVectors(
-            FileSchema fileSchema, String[] resolvedColumnNames) {
-        WritableColumnVector[] columns = new WritableColumnVector[projectedTypes.length];
-        for (int i = 0; i < projectedTypes.length; i++) {
-            dev.hardwood.metadata.PhysicalType physicalType = null;
-            if (resolvedColumnNames[i] != null
-                    && projectedTypes[i].getTypeRoot() == LogicalTypeRoot.DECIMAL) {
-                dev.hardwood.schema.SchemaNode node = fileSchema.getField(resolvedColumnNames[i]);
-                if (node instanceof dev.hardwood.schema.SchemaNode.PrimitiveNode) {
-                    physicalType = ((dev.hardwood.schema.SchemaNode.PrimitiveNode) node).type();
-                }
-            }
-            columns[i] = createWritableVectorForType(batchSize, projectedTypes[i], physicalType);
-        }
-        return columns;
-    }
-
     /**
-     * Create a WritableColumnVector based on the Flink LogicalType. For DECIMAL columns, the actual
-     * Parquet physical type is used to select the correct vector type, since the Parquet encoding
-     * may differ from what Flink's precision-based heuristic would predict.
+     * Wraps a writable vector for read-side consumption. For DECIMAL-typed top-level fields, we
+     * expose the underlying int/long/bytes vector as a {@link
+     * org.apache.flink.formats.parquet.vector.ParquetDecimalVector} so that {@link
+     * ColumnVector#getDecimal} works against the Parquet physical encoding.
      */
-    private static WritableColumnVector createWritableVectorForType(
-            int batchSize,
-            LogicalType fieldType,
-            @Nullable dev.hardwood.metadata.PhysicalType parquetPhysicalType) {
-        switch (fieldType.getTypeRoot()) {
-            case BOOLEAN:
-                return new org.apache.flink.table.data.columnar.vector.heap.HeapBooleanVector(
-                        batchSize);
-            case TINYINT:
-                return new org.apache.flink.table.data.columnar.vector.heap.HeapByteVector(
-                        batchSize);
-            case SMALLINT:
-                return new org.apache.flink.table.data.columnar.vector.heap.HeapShortVector(
-                        batchSize);
-            case INTEGER:
-            case DATE:
-            case TIME_WITHOUT_TIME_ZONE:
-                return new org.apache.flink.table.data.columnar.vector.heap.HeapIntVector(
-                        batchSize);
-            case BIGINT:
-                return new org.apache.flink.table.data.columnar.vector.heap.HeapLongVector(
-                        batchSize);
-            case FLOAT:
-                return new org.apache.flink.table.data.columnar.vector.heap.HeapFloatVector(
-                        batchSize);
-            case DOUBLE:
-                return new org.apache.flink.table.data.columnar.vector.heap.HeapDoubleVector(
-                        batchSize);
-            case CHAR:
-            case VARCHAR:
-            case BINARY:
-            case VARBINARY:
-                return new org.apache.flink.table.data.columnar.vector.heap.HeapBytesVector(
-                        batchSize);
-            case TIMESTAMP_WITHOUT_TIME_ZONE:
-            case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
-                return new org.apache.flink.table.data.columnar.vector.heap.HeapTimestampVector(
-                        batchSize);
-            case DECIMAL:
-                if (parquetPhysicalType != null) {
-                    // Use actual Parquet physical type to match fillDecimalVector expectations
-                    switch (parquetPhysicalType) {
-                        case INT32:
-                            return new org.apache.flink.table.data.columnar.vector.heap
-                                    .HeapIntVector(batchSize);
-                        case INT64:
-                            return new org.apache.flink.table.data.columnar.vector.heap
-                                    .HeapLongVector(batchSize);
-                        default:
-                            return new org.apache.flink.table.data.columnar.vector.heap
-                                    .HeapBytesVector(batchSize);
-                    }
-                }
-                // Fallback to precision-based heuristic when file schema is unavailable
-                org.apache.flink.table.types.logical.DecimalType decimalType =
-                        (org.apache.flink.table.types.logical.DecimalType) fieldType;
-                int precision = decimalType.getPrecision();
-                if (org.apache.flink.formats.parquet.utils.ParquetSchemaConverter.is32BitDecimal(
-                        precision)) {
-                    return new org.apache.flink.table.data.columnar.vector.heap.HeapIntVector(
-                            batchSize);
-                } else if (org.apache.flink.formats.parquet.utils.ParquetSchemaConverter
-                        .is64BitDecimal(precision)) {
-                    return new org.apache.flink.table.data.columnar.vector.heap.HeapLongVector(
-                            batchSize);
-                } else {
-                    return new org.apache.flink.table.data.columnar.vector.heap.HeapBytesVector(
-                            batchSize);
-                }
-            default:
-                throw new UnsupportedOperationException(
-                        "Hardwood reader does not yet support type: " + fieldType);
+    private static ColumnVector wrapReadable(WritableColumnVector v, LogicalType type) {
+        if (type.getTypeRoot() == org.apache.flink.table.types.logical.LogicalTypeRoot.DECIMAL) {
+            return new org.apache.flink.formats.parquet.vector.ParquetDecimalVector(v);
         }
-    }
-
-    /**
-     * Create readable vectors from writable vectors. Especially for decimal, see {@link
-     * ParquetDecimalVector}.
-     */
-    private ColumnVector[] createReadableVectors(WritableColumnVector[] writableVectors) {
-        ColumnVector[] vectors = new ColumnVector[writableVectors.length];
-        for (int i = 0; i < writableVectors.length; i++) {
-            vectors[i] =
-                    projectedTypes[i].getTypeRoot() == LogicalTypeRoot.DECIMAL
-                            ? new ParquetDecimalVector(writableVectors[i])
-                            : writableVectors[i];
-        }
-        return vectors;
+        return v;
     }
 
     /**
@@ -328,19 +258,21 @@ public abstract class ParquetVectorizedInputFormat<T, SplitT extends FileSourceS
     private class HardwoodReader implements BulkFormat.Reader<T> {
 
         private dev.hardwood.reader.ParquetFileReader fileReader;
+        private HardwoodFieldReader[] fieldReaders;
 
-        /** One Hardwood ColumnReader per projected column. Null if column is missing. */
-        private ColumnReader[] columnReaders;
+        /**
+         * Coordinated readers for all projected leaf columns; {@link ColumnReaders#nextBatch()}
+         * advances them in lockstep at the same row-group boundaries. {@code null} when every
+         * projected field is absent from the file.
+         */
+        @Nullable private ColumnReaders columnReaders;
 
-        private final long totalRowCount;
         private final Pool<ParquetReaderBatch<T>> pool;
 
+        /** Total rows yielded by this reader so far — used to report checkpoint positions. */
         private long rowsReturned;
-        private long recordsToSkip;
-        private boolean readersInitialized;
 
-        /** Resolved column names in the file schema. Null entry means column is missing. */
-        private final String[] resolvedColumnNames;
+        private long recordsToSkip;
 
         /** Current position within the active Hardwood batch. */
         private int hardwoodBatchOffset;
@@ -353,16 +285,15 @@ public abstract class ParquetVectorizedInputFormat<T, SplitT extends FileSourceS
 
         private HardwoodReader(
                 dev.hardwood.reader.ParquetFileReader fileReader,
-                String[] resolvedColumnNames,
-                long totalRowCount,
+                @Nullable ColumnReaders columnReaders,
+                HardwoodFieldReader[] fieldReaders,
                 Pool<ParquetReaderBatch<T>> pool) {
             this.fileReader = fileReader;
-            this.resolvedColumnNames = resolvedColumnNames;
-            this.totalRowCount = totalRowCount;
+            this.columnReaders = columnReaders;
+            this.fieldReaders = fieldReaders;
             this.pool = pool;
             this.rowsReturned = 0;
             this.recordsToSkip = 0;
-            this.readersInitialized = false;
             this.hardwoodBatchOffset = 0;
             this.hardwoodBatchSize = 0;
             this.hasHardwoodBatch = false;
@@ -390,14 +321,6 @@ public abstract class ParquetVectorizedInputFormat<T, SplitT extends FileSourceS
             }
             batch.columnarBatch.setNumRows(0);
 
-            if (rowsReturned >= totalRowCount) {
-                return false;
-            }
-
-            if (!readersInitialized) {
-                initColumnReaders();
-            }
-
             // If we've consumed the current Hardwood batch, fetch the next one
             if (!hasHardwoodBatch || hardwoodBatchOffset >= hardwoodBatchSize) {
                 if (!advanceHardwoodBatch()) {
@@ -405,22 +328,12 @@ public abstract class ParquetVectorizedInputFormat<T, SplitT extends FileSourceS
                 }
             }
 
-            // Determine how many records to serve in this Flink batch
             int remaining = hardwoodBatchSize - hardwoodBatchOffset;
-            int num = (int) Math.min(Math.min(remaining, batchSize), totalRowCount - rowsReturned);
+            int num = Math.min(remaining, batchSize);
 
-            for (int i = 0; i < columnReaders.length; i++) {
-                if (columnReaders[i] == null) {
-                    batch.writableVectors[i].fillWithNulls();
-                } else {
-                    HardwoodColumnVectorFiller.fillVector(
-                            projectedTypes[i],
-                            columnReaders[i],
-                            batch.writableVectors[i],
-                            num,
-                            hardwoodBatchOffset,
-                            isUtcTimestamp);
-                }
+            for (int i = 0; i < fieldReaders.length; i++) {
+                fieldReaders[i].fillVector(
+                        batch.writableVectors[i], num, hardwoodBatchOffset, isUtcTimestamp);
             }
 
             hardwoodBatchOffset += num;
@@ -429,40 +342,30 @@ public abstract class ParquetVectorizedInputFormat<T, SplitT extends FileSourceS
             return true;
         }
 
-        /** Advance all column readers to the next Hardwood batch. Returns false if no more data. */
+        /**
+         * Advance all projected leaf columns to the next batch in lockstep. {@link
+         * ColumnReaders#nextBatch()} drives every reader at the same row-group boundary and
+         * validates that they report the same record count.
+         *
+         * <p>If every projected field is missing from the file (no column readers), this reader
+         * yields zero rows. Projecting only nonexistent fields is unusual; users that need this
+         * behavior should include at least one column known to exist in the file.
+         */
         private boolean advanceHardwoodBatch() {
             hardwoodBatchOffset = 0;
             hardwoodBatchSize = 0;
             hasHardwoodBatch = false;
 
-            for (int i = 0; i < columnReaders.length; i++) {
-                if (columnReaders[i] != null) {
-                    if (!hasHardwoodBatch) {
-                        if (!columnReaders[i].nextBatch()) {
-                            return false;
-                        }
-                        hardwoodBatchSize = columnReaders[i].getRecordCount();
-                        hasHardwoodBatch = true;
-                    } else {
-                        columnReaders[i].nextBatch();
-                    }
-                }
+            if (columnReaders == null || !columnReaders.nextBatch()) {
+                return false;
             }
-            return hasHardwoodBatch;
-        }
 
-        private void initColumnReaders() {
-            columnReaders = new ColumnReader[resolvedColumnNames.length];
-            for (int i = 0; i < resolvedColumnNames.length; i++) {
-                if (resolvedColumnNames[i] != null) {
-                    columnReaders[i] = fileReader.createColumnReader(resolvedColumnNames[i]);
-                }
-            }
-            readersInitialized = true;
+            hardwoodBatchSize = columnReaders.getRecordCount();
+            hasHardwoodBatch = true;
+            return true;
         }
 
         public void seek(long rowCount) {
-            // Hardwood reads entire files; skip records from the beginning.
             this.recordsToSkip = rowCount;
         }
 
@@ -484,13 +387,10 @@ public abstract class ParquetVectorizedInputFormat<T, SplitT extends FileSourceS
         @Override
         public void close() throws IOException {
             if (columnReaders != null) {
-                for (ColumnReader cr : columnReaders) {
-                    if (cr != null) {
-                        cr.close();
-                    }
-                }
+                columnReaders.close();
                 columnReaders = null;
             }
+            fieldReaders = null;
             if (fileReader != null) {
                 fileReader.close();
                 fileReader = null;
