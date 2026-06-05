@@ -135,6 +135,14 @@ public abstract class ParquetVectorizedInputFormat<T, SplitT extends FileSourceS
                                 .filter(
                                         dev.hardwood.reader.RowGroupPredicate.byteRange(
                                                 splitStart, splitEnd))
+                                // Match Hardwood's batch size to Flink's vector capacity. Hardwood
+                                // caps a batch by record count, not leaf-value count, so for a
+                                // repeated column the default (262K records) would eagerly
+                                // materialize that many records' worth of list elements — amplified
+                                // by the average list length — before we slice it into Flink-sized
+                                // vectors. Aligning the sizes bounds per-batch element
+                                // materialization to roughly one Flink batch.
+                                .batchSize(batchSize)
                                 .build();
 
         HardwoodFieldReader[] fieldReaders = new HardwoodFieldReader[projectedTypes.length];
@@ -251,9 +259,11 @@ public abstract class ParquetVectorizedInputFormat<T, SplitT extends FileSourceS
     /**
      * Inner reader that uses Hardwood's ColumnReader API for batch-oriented columnar reading.
      *
-     * <p>Hardwood produces large batches (default 262K records). Flink consumes smaller batches
-     * (typically 2048). This reader tracks position within a Hardwood batch and serves Flink-sized
-     * slices without losing data.
+     * <p>Hardwood's batch size is matched to Flink's vector capacity (see {@code createReader}), so
+     * a Hardwood batch normally maps to a single Flink batch. The reader still tracks position
+     * within a Hardwood batch and serves Flink-sized slices, so it stays correct if the two sizes
+     * ever diverge — Hardwood caps a batch by record count, and for a repeated column a single
+     * batch can still carry more leaf values than records.
      */
     private class HardwoodReader implements BulkFormat.Reader<T> {
 

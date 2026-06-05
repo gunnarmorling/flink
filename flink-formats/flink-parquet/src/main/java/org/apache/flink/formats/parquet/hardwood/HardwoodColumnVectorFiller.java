@@ -46,10 +46,10 @@ import java.util.concurrent.TimeUnit;
 /**
  * Fills Flink's {@link WritableColumnVector} from Hardwood's {@link ColumnReader} batch output.
  *
- * <p>Supports an offset into the Hardwood batch, allowing Flink to consume smaller slices of
- * Hardwood's larger batches (default 262K records). Handles flat primitives as well as ARRAY, MAP
- * and ROW types built from Hardwood's layer-model column API ({@code getLayerOffsets(layer)},
- * {@code getLayerValidity(layer)}, {@code getLeafValidity()}).
+ * <p>Supports an offset into the Hardwood batch, allowing Flink to consume a Hardwood batch as one
+ * or more Flink-sized slices. Handles flat primitives as well as ARRAY, MAP and ROW types built
+ * from Hardwood's layer-model column API ({@code getLayerOffsets(layer)}, {@code
+ * getLayerValidity(layer)}, {@code getLeafValidity()}).
  */
 public final class HardwoodColumnVectorFiller {
 
@@ -434,12 +434,13 @@ public final class HardwoodColumnVectorFiller {
 
         long[] outOffsets = new long[count];
         long[] outLengths = new long[count];
+        boolean anyNullArray = recordValidity.hasNulls();
         for (int r = 0; r < count; r++) {
             int srcIdx = offset + r;
             int start = recordOffsets[srcIdx];
             outOffsets[r] = start - firstValue;
             outLengths[r] = recordOffsets[srcIdx + 1] - start;
-            if (recordValidity.isNull(srcIdx)) {
+            if (anyNullArray && recordValidity.isNull(srcIdx)) {
                 vector.setNullAt(r);
             }
         }
@@ -497,12 +498,13 @@ public final class HardwoodColumnVectorFiller {
 
         long[] outOffsets = new long[count];
         long[] outLengths = new long[count];
+        boolean anyNullMap = recordValidity.hasNulls();
         for (int r = 0; r < count; r++) {
             int srcIdx = offset + r;
             int start = recordOffsets[srcIdx];
             outOffsets[r] = start - firstValue;
             outLengths[r] = recordOffsets[srcIdx + 1] - start;
-            if (recordValidity.isNull(srcIdx)) {
+            if (anyNullMap && recordValidity.isNull(srcIdx)) {
                 vector.setNullAt(r);
             }
         }
